@@ -288,21 +288,25 @@ mutable struct InferenceState
     end
 end
 
-function InferenceState(linfo::MethodInstance,
-                        optimize::Bool, cached::Bool, params::InferenceParams)
-    # prepare an InferenceState object for inferring lambda
-    src = retrieve_code_info(linfo)
-    src === nothing && return nothing
+function _validate(linfo::MethodInstance, src::CodeInfo, kind::String)
     if JLOptions().debug_level == 2
         # this is a debug build of julia, so let's validate linfo
         errors = validate_code(linfo, src)
         if !isempty(errors)
             for e in errors
-                println(STDERR, "WARNING: Encountered invalid lowered code for method ",
+                println(STDERR, "WARNING: Encountered invalid ", kind, " code for method ",
                         linfo.def, ": ", e)
             end
         end
     end
+end
+
+function InferenceState(linfo::MethodInstance,
+                        optimize::Bool, cached::Bool, params::InferenceParams)
+    # prepare an InferenceState object for inferring lambda
+    src = retrieve_code_info(linfo)
+    src === nothing && return nothing
+    _validate(linfo, src, "lowered")
     return InferenceState(linfo, src, optimize, cached, params)
 end
 
@@ -2446,8 +2450,6 @@ function abstract_eval(@nospecialize(e), vtypes::VarTable, sv::InferenceState)
     e = e::Expr
     if e.head === :call
         t = abstract_eval_call(e, vtypes, sv)
-    elseif e.head === :null
-        t = Void
     elseif e.head === :new
         t = instanceof_tfunc(abstract_eval(e.args[1], vtypes, sv))[1]
         for i = 2:length(e.args)
@@ -3087,6 +3089,15 @@ end
 
 #### entry points for inferring a MethodInstance given a type signature ####
 
+function is_self_quoting(@nospecialize(x))
+    return isa(x,Number) || isa(x,AbstractString) || isa(x,Tuple) || isa(x,Type) || isa(x,Char) || x === nothing ||
+        isa(x,Builtin) || isa(x,IntrinsicFunction)
+end
+
+function quoted(@nospecialize(x))
+    return is_self_quoting(x) ? x : QuoteNode(x)
+end
+
 # compute an inferred AST and return type
 function typeinf_code(method::Method, @nospecialize(atypes), sparams::SimpleVector,
                       optimize::Bool, cached::Bool, params::InferenceParams)
@@ -3107,7 +3118,7 @@ function typeinf_code(linfo::MethodInstance, optimize::Bool, cached::Bool,
                 if linfo.jlcall_api == 2
                     method = linfo.def::Method
                     tree = ccall(:jl_new_code_info_uninit, Ref{CodeInfo}, ())
-                    tree.code = Any[ Expr(:return, QuoteNode(linfo.inferred_const)) ]
+                    tree.code = Any[ Expr(:return, quoted(linfo.inferred_const)) ]
                     tree.slotnames = Any[ compiler_temp_sym for i = 1:method.nargs ]
                     tree.slotflags = UInt8[ 0 for i = 1:method.nargs ]
                     tree.slottypes = nothing
@@ -3549,6 +3560,7 @@ function optimize(me::InferenceState)
         me.src.inlineable = isinlineable(def, me.src, me.mod, me.params, bonus)
     end
     me.src.inferred = true
+    _validate(me.linfo, me.src, "optimized")
     nothing
 end
 
@@ -3789,7 +3801,7 @@ function _widen_all_consts!(e::Expr, untypedload::Vector{Bool}, slottypes::Vecto
         elseif isa(x, TypedSlot)
             vt = widenconst(x.typ)
             if !(vt === x.typ)
-                if slottypes[x.id] <: vt
+                if slottypes[x.id] ⊑ vt
                     x = SlotNumber(x.id)
                     untypedload[x.id] = true
                 else
@@ -3871,9 +3883,7 @@ function substitute!(
         e = e::Expr
         head = e.head
         if head === :static_parameter
-            sp = spvals[e.args[1]]
-            is_self_quoting(sp) && return sp
-            return QuoteNode(sp)
+            return quoted(spvals[e.args[1]])
         elseif head === :foreigncall
             @assert !isa(spsig, UnionAll) || !isempty(spvals)
             for i = 1:length(e.args)
@@ -4007,7 +4017,7 @@ function effect_free(@nospecialize(e), src::CodeInfo, mod::Module, allow_volatil
         end
         if head === :static_parameter
             # if we aren't certain about the type, it might be an UndefVarError at runtime
-            return isa(e.typ, DataType) && isleaftype(e.typ)
+            return (isa(e.typ, DataType) && isleaftype(e.typ)) || isa(e.typ, Const)
         end
         if e.typ === Bottom
             return false
@@ -4065,6 +4075,8 @@ function effect_free(@nospecialize(e), src::CodeInfo, mod::Module, allow_volatil
             # fall-through
         elseif head === :return
             # fall-through
+        elseif head === :isdefined
+            return allow_volatile
         elseif head === :the_exception
             return allow_volatile
         else
@@ -4112,14 +4124,7 @@ function inline_as_constant(@nospecialize(val), argexprs, sv::InferenceState, @n
             push!(stmts, invoke_texpr)
         end
     end
-    if !is_self_quoting(val)
-        val = QuoteNode(val)
-    end
-    return (val, stmts)
-end
-
-function is_self_quoting(@nospecialize(x))
-    return isa(x,Number) || isa(x,AbstractString) || isa(x,Tuple) || isa(x,Type)
+    return (quoted(val), stmts)
 end
 
 function countunionsplit(atypes)
@@ -4221,9 +4226,11 @@ function invoke_NF(argexprs, @nospecialize(etype), atypes::Vector{Any}, sv::Infe
                         local match = splitunion(atypes, i - 1)
                         if match !== false
                             after = genlabel(sv)
+                            isa_var = newvar!(sv, Bool)
                             isa_ty = Expr(:call, GlobalRef(Core, :isa), aei, ty)
                             isa_ty.typ = Bool
-                            unshift!(match, Expr(:gotoifnot, isa_ty, after.label))
+                            unshift!(match, Expr(:gotoifnot, isa_var, after.label))
+                            unshift!(match, Expr(:(=), isa_var, isa_ty))
                             append!(stmts, match)
                             push!(stmts, after)
                         else
@@ -4381,11 +4388,12 @@ function inlineable(@nospecialize(f), @nospecialize(ft), e::Expr, atypes::Vector
         if isa(e.typ, Const)
             return inline_as_constant(e.typ.val, argexprs, sv, nothing)
         end
-        not_is = Expr(:call, GlobalRef(Core.Intrinsics, :not_int),
-                             Expr(:call, GlobalRef(Core, :(===)), argexprs[2], argexprs[3]))
+        is_var = newvar!(sv, Bool)
+        stmts = Any[ Expr(:(=), is_var, Expr(:call, GlobalRef(Core, :(===)), argexprs[2], argexprs[3])) ]
+        stmts[1].args[2].typ = Bool
+        not_is = Expr(:call, GlobalRef(Core.Intrinsics, :not_int), is_var)
         not_is.typ = Bool
-        not_is.args[2].typ = Bool
-        return (not_is, ())
+        return (not_is, stmts)
     elseif length(atypes) == 3 && istopfunction(topmod, f, :(>:))
         # special-case inliner for issupertype
         # that works, even though inference generally avoids inferring the `>:` Method
@@ -4602,6 +4610,12 @@ function inlineable(@nospecialize(f), @nospecialize(ft), e::Expr, atypes::Vector
     stmts_free = true # true = all entries of stmts are effect_free
 
     argexprs = copy(argexprs)
+    if isva
+        # move constructed vararg tuple to an ssavalue
+        varargvar = newvar!(sv, atypes[na])
+        push!(prelude_stmts, Expr(:(=), varargvar, argexprs[na]))
+        argexprs[na] = varargvar
+    end
     for i = na:-1:1 # stmts_free needs to be calculated in reverse-argument order
         #args_i = args[i]
         aei = argexprs[i]
@@ -4979,7 +4993,7 @@ function inlining_pass!(sv::InferenceState, propagate_inbounds::Bool)
                 else
                      boundscheck = :on
                 end
-                eargs[i] = inlining_pass(ei, sv, stmtbuf, 1, boundscheck)
+                eargs[i] = inline_expr(ei, sv, stmtbuf, boundscheck)
                 if !isempty(stmtbuf)
                     splice!(eargs, i:(i - 1), stmtbuf)
                     i += length(stmtbuf)
@@ -4993,121 +5007,26 @@ end
 
 const corenumtype = Union{Int32, Int64, Float32, Float64}
 
-# return inlined replacement for `e`, inserting new needed statements
-# at index `ins` in `stmts`.
-function inlining_pass(e::Expr, sv::InferenceState, stmts::Vector{Any}, ins, boundscheck::Symbol)
-    if e.head === :meta
-        # ignore meta nodes
-        return e
-    end
-    if e.head === :method
-        # avoid running the inlining pass on function definitions
-        return e
-    end
-    # inliners for special expressions
-    if e.head === :boundscheck
-        return e
-    end
-    if e.head === :isdefined
+function inline_expr(e::Expr, sv::InferenceState, stmts::Vector{Any}, boundscheck::Symbol)
+    if e.head === :call
+        return inline_call(e, sv, stmts, boundscheck)
+    elseif e.head === :isdefined
         isa(e.typ, Const) && return e.typ.val
-        return e
+    elseif e.head === :(=) && isa(e.args[2], Expr)
+        e.args[2] = inline_expr(e.args[2], sv, stmts, boundscheck)
+    elseif e.head === :return && isa(e.args[1], Expr)
+        e.args[1] = inline_expr(e.args[1], sv, stmts, boundscheck)
     end
+    return e
+end
 
+# return inlined replacement for call `e`, inserting new needed statements in `stmts`.
+function inline_call(e::Expr, sv::InferenceState, stmts::Vector{Any}, boundscheck::Symbol)
     eargs = e.args
     if length(eargs) < 1
         return e
     end
     arg1 = eargs[1]
-    isccall = false
-    i0 = 1
-    # don't inline first (global) arguments of ccall, as this needs to be evaluated
-    # by the interpreter and inlining might put in something it can't handle,
-    # like another ccall (or try to move the variables out into the function)
-    if e.head === :foreigncall
-        # 5 is rewritten to 1 below to handle the callee.
-        i0 = 5
-        isccall = true
-    elseif is_known_call(e, Core.Intrinsics.llvmcall, sv.src, sv.mod)
-        i0 = 5
-    end
-    has_stmts = false # needed to preserve order-of-execution
-    prev_stmts_length = length(stmts)
-    for _i = length(eargs):-1:i0
-        if isccall && _i == 5
-            i = 1
-            isccallee = true
-        else
-            i = _i
-            isccallee = false
-        end
-        ei = eargs[i]
-        if isa(ei,Expr)
-            ei = ei::Expr
-            if ei.head === :&
-                argloc = ei.args
-                i = 1
-                ei = argloc[1]
-                if !isa(ei,Expr)
-                    continue
-                end
-                ei = ei::Expr
-            else
-                argloc = eargs
-            end
-            sl0 = length(stmts)
-            res = inlining_pass(ei, sv, stmts, ins, boundscheck)
-            ns = length(stmts) - sl0  # number of new statements just added
-            if isccallee
-                restype = exprtype(res, sv.src, sv.mod)
-                if isa(restype, Const)
-                    argloc[i] = restype.val
-                    if !effect_free(res, sv.src, sv.mod, false)
-                        insert!(stmts, ins+ns, res)
-                    end
-                    # Assume this is the last argument to process
-                    break
-                end
-            end
-            if has_stmts && !effect_free(res, sv.src, sv.mod, false)
-                restype = exprtype(res, sv.src, sv.mod)
-                vnew = newvar!(sv, restype)
-                argloc[i] = vnew
-                insert!(stmts, ins+ns, Expr(:(=), vnew, res))
-            else
-                argloc[i] = res
-            end
-            if !has_stmts && ns > 0 && !(_i == i0)
-                for s = ins:ins+ns-1
-                    stmt = stmts[s]
-                    if !effect_free(stmt, sv.src, sv.mod, true)
-                        has_stmts = true; break
-                    end
-                end
-            end
-        end
-    end
-    if isccall
-        le = length(eargs)
-        nccallargs = eargs[5]::Int
-        ccallargs = ObjectIdDict()
-        for i in 6:(5 + nccallargs)
-            ccallargs[eargs[i]] = nothing
-        end
-        i = 6 + nccallargs
-        while i <= le
-            rootarg = eargs[i]
-            if haskey(ccallargs, rootarg)
-                deleteat!(eargs, i)
-                le -= 1
-            elseif i < le
-                ccallargs[rootarg] = nothing
-            end
-            i += 1
-        end
-    end
-    if e.head !== :call
-        return e
-    end
 
     ft = exprtype(arg1, sv.src, sv.mod)
     if isa(ft, Const)
@@ -5122,8 +5041,10 @@ function inlining_pass(e::Expr, sv::InferenceState, stmts::Vector{Any}, ins, bou
         end
     end
 
-    ins += (length(stmts) - prev_stmts_length)
+    ins = 1
 
+    # TODO: determine whether this is really necessary
+#=
     if sv.params.inlining
         if isdefined(Main, :Base) &&
             ((isdefined(Main.Base, :^) && f === Main.Base.:^) ||
@@ -5158,7 +5079,7 @@ function inlining_pass(e::Expr, sv::InferenceState, stmts::Vector{Any}, ins, bou
             end
         end
     end
-
+=#
     for ninline = 1:100
         ata = Vector{Any}(length(e.args))
         ata[1] = ft
@@ -5196,18 +5117,15 @@ function inlining_pass(e::Expr, sv::InferenceState, stmts::Vector{Any}, ins, bou
                 aarg = e.args[i]
                 argt = exprtype(aarg, sv.src, sv.mod)
                 t = widenconst(argt)
-                if isa(aarg, Expr) && (is_known_call(aarg, tuple, sv.src, sv.mod) || is_known_call(aarg, svec, sv.src, sv.mod))
-                    # apply(f, tuple(x, y, ...)) => f(x, y, ...)
-                    newargs[i - 2] = aarg.args[2:end]
-                elseif isa(argt, Const) && (isa(argt.val, Tuple) || isa(argt.val, SimpleVector)) &&
+                if isa(argt, Const) && (isa(argt.val, Tuple) || isa(argt.val, SimpleVector)) &&
                         effect_free(aarg, sv.src, sv.mod, true)
                     val = argt.val
-                    newargs[i - 2] = Any[ QuoteNode(val[i]) for i in 1:(length(val)::Int) ] # avoid making a tuple Generator here!
+                    newargs[i - 2] = Any[ quoted(val[i]) for i in 1:(length(val)::Int) ] # avoid making a tuple Generator here!
                 elseif isa(aarg, Tuple) || (isa(aarg, QuoteNode) && (isa(aarg.value, Tuple) || isa(aarg.value, SimpleVector)))
                     if isa(aarg, QuoteNode)
                         aarg = aarg.value
                     end
-                    newargs[i - 2] = Any[ QuoteNode(aarg[i]) for i in 1:(length(aarg)::Int) ] # avoid making a tuple Generator here!
+                    newargs[i - 2] = Any[ quoted(aarg[i]) for i in 1:(length(aarg)::Int) ] # avoid making a tuple Generator here!
                 elseif isa(t, DataType) && t.name === Tuple.name && !isvatuple(t) &&
                          length(t.parameters) <= sv.params.MAX_TUPLE_SPLAT
                     for k = (effect_free_upto + 1):(i - 3)
@@ -5235,7 +5153,12 @@ function inlining_pass(e::Expr, sv::InferenceState, stmts::Vector{Any}, ins, bou
                     else
                         tp = t.parameters
                     end
-                    newargs[i - 2] = Any[ mk_getfield(tmpv, j, tp[j]) for j in 1:(length(tp)::Int) ]
+                    ntp = length(tp)::Int
+                    fldvars = Any[ newvar!(sv, tp[j]) for j in 1:ntp ]
+                    for j = 1:ntp
+                        push!(newstmts, Expr(:(=), fldvars[j], mk_getfield(tmpv, j, tp[j])))
+                    end
+                    newargs[i - 2] = fldvars
                 else
                     # not all args expandable
                     return e
@@ -5376,10 +5299,10 @@ function get_replacement(table::ObjectIdDict, var::Union{SlotNumber, SSAValue}, 
     if isa(init, Expr) && init.head === :static_parameter
         # if we aren't certain about the type, it might be an UndefVarError at runtime (!effect_free)
         # so we need to preserve the original point of assignment
-        if isa(init.typ, DataType) && isleaftype(init.typ)
+        if (isa(init.typ, DataType) && isleaftype(init.typ)) || isa(init.typ, Const)
             return init
         end
-    elseif isa(init, corenumtype) || init === () || init === nothing
+    elseif isa(init, Number) || init === () || init === nothing || isa(init, Type) || isa(init, Char) || isa(init, IntrinsicFunction) || isa(init, Builtin)
         return init
     elseif isa(init, Slot) && is_argument(nargs, init::Slot)
         # the transformation is not ideal if the assignment
@@ -5412,6 +5335,10 @@ function get_replacement(table::ObjectIdDict, var::Union{SlotNumber, SSAValue}, 
                 rep = TypedSlot(rep.id, init.typ)
             end
             return rep
+        end
+    elseif isa(init, GlobalRef)
+        if isdefined(init.mod, init.name) && isconst(init.mod, init.name)
+            return init
         end
     end
     return var
@@ -5553,6 +5480,9 @@ function void_use_elim_pass!(sv::InferenceState)
             h = ex.head
             if h === :return || h === :(=) || h === :gotoifnot || is_meta_expr_head(h)
                 return true
+            end
+            if h === :isdefined
+                return false
             end
             return !effect_free(ex, sv.src, sv.mod, false)
         elseif (isa(ex, GotoNode) || isa(ex, LineNumberNode) ||
@@ -5717,11 +5647,7 @@ function _getfield_elim_pass!(e::Expr, sv::InferenceState)
                     end
                 end
                 if isdefined(e1, j)
-                    e1j = getfield(e1, j)
-                    if !is_self_quoting(e1j)
-                        e1j = QuoteNode(e1j)
-                    end
-                    return e1j
+                    return quoted(getfield(e1, j))
                 end
             end
         end
