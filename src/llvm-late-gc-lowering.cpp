@@ -255,8 +255,11 @@ struct State {
     // The result of the local analysis
     std::map<BasicBlock *, BBState> BBStates;
 
-    // Refinement map. If all of the values are rooted (-1 means a globally rooted value),
+    // Refinement map. If all of the values are rooted (-1 means an externally rooted value),
     // the key is already rooted (but not the other way around).
+    // At the end of `LocalScan` this map has a few properties
+    // 1. Values are either -1 or dominates the key
+    // 2. Therefore this is a DAG
     std::map<int, SmallVector<int, 1>> Refinements;
 
     // GC preserves map. All safepoints dominated by the map key, but not any
@@ -360,6 +363,9 @@ private:
     Instruction *get_pgcstack(Instruction *ptlsStates);
     bool CleanupIR(Function &F);
     void NoteUseChain(State &S, BBState &BBS, User *TheUser);
+    SmallVector<int, 1> GetPHIRefinements(PHINode *phi, State &S);
+    void FixUpRefinements(ArrayRef<int> PHINumbers, State &S);
+    void RefineLiveSet(BitVector &LS, State &S);
 };
 
 static unsigned getValueAddrSpace(Value *V) {
@@ -748,8 +754,78 @@ static bool LooksLikeFrameRef(Value *V) {
     return isa<Argument>(V);
 }
 
+SmallVector<int, 1> LateLowerGCFrame::GetPHIRefinements(PHINode *Phi, State &S)
+{
+    // The returned vector can violate the domination property of the Refinements map.
+    // However, we can't know for sure if this is valid here since incoming values
+    // that does not dominate the PHI node may be externally rooted (i.e. can be refined to -1)
+    // We only know that after scaning the whole function so we'll record the possibly invalid
+    // edges here and fix them up at the end of `LocalScan`. (See `FixUpRefinements` below).
+    auto nIncoming = Phi->getNumIncomingValues();
+    SmallVector<int, 1> RefinedPtr(nIncoming);
+    for (unsigned i = 0; i < nIncoming; ++i)
+        RefinedPtr[i] = Number(S, Phi->getIncomingValue(i));
+    return RefinedPtr;
+}
+
+void LateLowerGCFrame::FixUpRefinements(ArrayRef<int> PHINumbers, State &S)
+{
+    // Now we have all the possible refinement information, we can remove ones for the invalid
+    // First propagate all external rooted values
+    BitVector extern_rooted(S.MaxPtrNumber + 1, false);
+    bool changed;
+    do {
+        changed = false;
+        for (auto &kv: S.Refinements) {
+            int Num = kv.first;
+            // Not sure if `Num` can be `-1`
+            if (Num == -1 || HasBitSet(extern_rooted, Num) || kv.second.empty())
+                continue;
+            bool isconst = true;
+            for (auto &refine: kv.second) {
+                if (refine == -1)
+                    continue;
+                if (HasBitSet(extern_rooted, refine)) {
+                    changed = true;
+                    refine = -1;
+                    continue;
+                }
+                isconst = false;
+                break;
+            }
+            if (isconst) {
+                changed = true;
+                extern_rooted[Num] = true;
+            }
+        }
+    } while (changed);
+    // Scan all phi node refinements and remove all invalid ones.
+    DominatorTree *DT = nullptr;
+    for (auto Num: PHINumbers) {
+        // Not sure if `Num` can be `-1`
+        if (Num == -1 || HasBitSet(extern_rooted, Num))
+            continue;
+        auto Phi = cast<PHINode>(S.ReversePtrNumbering[Num]);
+        auto &RefinedPtr = S.Refinements[Num];
+        for (auto refine: RefinedPtr) {
+            if (refine == -1)
+                continue;
+            if (auto inst = dyn_cast<Instruction>(S.ReversePtrNumbering[refine])) {
+                if (!DT)
+                    DT = &getAnalysis<DominatorTreeWrapperPass>().getDomTree();
+                if (!DT->dominates(inst, Phi)) {
+                    // Invalid
+                    RefinedPtr = SmallVector<int, 1>{};
+                    break;
+                }
+            }
+        }
+    }
+}
+
 State LateLowerGCFrame::LocalScan(Function &F) {
     State S;
+    SmallVector<int, 16> PHINumbers;
     for (BasicBlock &BB : F) {
         BBState &BBS = S.BBStates[&BB];
         for (auto it = BB.rbegin(); it != BB.rend(); ++it) {
@@ -861,17 +937,11 @@ State LateLowerGCFrame::LocalScan(Function &F) {
                         continue;
                     auto Num = LiftPhi(S, Phi);
                     auto lift = cast<PHINode>(S.ReversePtrNumbering[Num]);
-                    SmallVector<int, 1> RefinedPtr(0);
-                    // DISABLED DUE TO BUG IN THE ALGORITHM (#24098)
-                    //for (unsigned i = 0; i < nIncoming; ++i)
-                    //    RefinedPtr[i] = Number(S, lift->getIncomingValue(i));
-                    S.Refinements[Num] = std::move(RefinedPtr);
+                    S.Refinements[Num] = GetPHIRefinements(lift, S);
+                    PHINumbers.push_back(Num);
                 } else {
-                    SmallVector<int, 1> RefinedPtr(0);
-                    // DISABLED DUE TO BUG IN THE ALGORITHM (#24098)
-                    //for (unsigned i = 0; i < nIncoming; ++i)
-                    //    RefinedPtr[i] = Number(S, Phi->getIncomingValue(i));
-                    MaybeNoteDef(S, BBS, Phi, BBS.Safepoints, std::move(RefinedPtr));
+                    MaybeNoteDef(S, BBS, Phi, BBS.Safepoints, GetPHIRefinements(Phi, S));
+                    PHINumbers.push_back(Number(S, Phi));
                     for (unsigned i = 0; i < nIncoming; ++i) {
                         BBState &IncomingBBS = S.BBStates[Phi->getIncomingBlock(i)];
                         NoteUse(S, IncomingBBS, Phi->getIncomingValue(i), IncomingBBS.PhiOuts);
@@ -904,6 +974,7 @@ State LateLowerGCFrame::LocalScan(Function &F) {
         BBS.UnrootedOut = BBS.DownExposedUnrooted;
         BBS.Done = true;
     }
+    FixUpRefinements(PHINumbers, S);
     return S;
 }
 
@@ -982,6 +1053,56 @@ JL_USED_FUNC static void dumpSafepointsForBBName(Function &F, State &S, const ch
     }
 }
 
+void LateLowerGCFrame::RefineLiveSet(BitVector &LS, State &S)
+{
+    BitVector FullLS(S.MaxPtrNumber + 1, false);
+    FullLS |= LS;
+    // First expand the live set according to the refinement map
+    // so that we can see all the values that are effectively live.
+    bool changed;
+    do {
+        changed = false;
+        for (auto &kv: S.Refinements) {
+            int Num = kv.first;
+            if (Num == -1 || HasBitSet(FullLS, Num) || kv.second.empty())
+                continue;
+            bool live = true;
+            for (auto &refine: kv.second) {
+                if (refine == -1 || HasBitSet(FullLS, refine))
+                    continue;
+                live = false;
+                break;
+            }
+            if (live) {
+                changed = true;
+                FullLS[Num] = 1;
+            }
+        }
+    } while (changed);
+    // Now remove all values from the LiveSet that's kept alive by other objects
+    do {
+        changed = false;
+        for (int Idx = LS.find_first(); Idx >= 0; Idx = LS.find_next(Idx)) {
+            if (!S.Refinements.count(Idx))
+                continue;
+            auto &RefinedPtr = S.Refinements[Idx];
+            if (RefinedPtr.empty())
+                continue;
+            bool rooted = true;
+            for (auto RefPtr: RefinedPtr) {
+                if (RefPtr == -1 || HasBitSet(FullLS, RefPtr))
+                    continue;
+                rooted = false;
+                break;
+            }
+            if (rooted) {
+                changed = true;
+                LS[Idx] = 0;
+            }
+        }
+    } while (changed);
+}
+
 void LateLowerGCFrame::ComputeLiveSets(Function &F, State &S) {
     DominatorTree *DT = nullptr;
     // Iterate over all safe points. Add to live sets all those variables that
@@ -999,24 +1120,7 @@ void LateLowerGCFrame::ComputeLiveSets(Function &F, State &S) {
             if (HasBitSet(BBS.LiveOut, Live))
                 LS[Live] = 1;
         }
-        // Apply refinements
-        for (int Idx = LS.find_first(); Idx >= 0; Idx = LS.find_next(Idx)) {
-            if (!S.Refinements.count(Idx))
-                continue;
-            auto &RefinedPtr = S.Refinements[Idx];
-            if (RefinedPtr.empty())
-                continue;
-            bool rooted = true;
-            for (auto RefPtr: RefinedPtr) {
-                if (RefPtr == -1 || HasBitSet(LS, RefPtr))
-                    continue;
-                rooted = false;
-                break;
-            }
-            if (rooted) {
-                LS[Idx] = 0;
-            }
-        }
+        RefineLiveSet(LS, S);
         // If the function has GC preserves, figure out whether we need to
         // add in any extra live values.
         if (!S.GCPreserves.empty()) {
