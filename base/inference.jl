@@ -3789,7 +3789,7 @@ function _widen_all_consts!(e::Expr, untypedload::Vector{Bool}, slottypes::Vecto
         elseif isa(x, TypedSlot)
             vt = widenconst(x.typ)
             if !(vt === x.typ)
-                if slottypes[x.id] <: vt
+                if slottypes[x.id] ⊑ vt
                     x = SlotNumber(x.id)
                     untypedload[x.id] = true
                 else
